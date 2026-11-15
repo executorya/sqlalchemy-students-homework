@@ -1,70 +1,103 @@
-from pathlib import Path
-
 import pytest
-from main import Base, StudentDatabase
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
+
+import main
 
 
 @pytest.fixture
-def db(tmp_path):
+def client(tmp_path, monkeypatch):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
-    Base.metadata.create_all(engine)
-    return StudentDatabase(engine)
+    main.Base.metadata.create_all(engine)
+
+    monkeypatch.setattr(main, "db", main.StudentDatabase(engine))
+
+    with TestClient(main.app) as test_client:
+        yield test_client
+
+    engine.dispose()
 
 
-def test_csv_import(db):
-    path = Path(__file__).resolve().parent / "students.csv"
-
-    assert db.load_from_csv(path) == 215
-    assert db.count_students() == 215
-    assert db.load_from_csv(path) == 0
-    assert db.count_students() == 215
-
-
-def test_insert(db):
-    db.add_student("Иванов", "Петр", "ФПМИ", "Физика", 85)
-
-    students = db.get_students_by_faculty("ФПМИ")
-
-    assert len(students) == 1
-    assert students[0].grade == 85
+@pytest.fixture
+def student_data():
+    return {
+        "last_name": "Иванов",
+        "first_name": "Пётр",
+        "faculty": "ФПМИ",
+        "course": "Физика",
+        "grade": 85,
+    }
 
 
-def test_faculty_filter(db):
-    path = Path(__file__).resolve().parent / "students.csv"
-    db.load_from_csv(path)
+def test_create_and_read(client, student_data):
+    response = client.post("/students", json=student_data)
 
-    assert len(db.get_students_by_faculty("ФПМИ")) == 40
-    assert db.get_students_by_faculty("НЕИЗВЕСТНЫЙ") == []
+    assert response.status_code == 201
+    assert response.json()["id"] == 1
 
+    response = client.get("/students/1")
 
-def test_unique_courses(db):
-    path = Path(__file__).resolve().parent / "students.csv"
-    db.load_from_csv(path)
-
-    assert db.get_unique_courses() == [
-        "Информатика",
-        "История",
-        "Мат. Анализ",
-        "Психология",
-        "Теор. Механика",
-        "Физика",
-    ]
+    assert response.status_code == 200
+    assert response.json()["grade"] == 85
 
 
-def test_low_grades(db):
-    path = Path(__file__).resolve().parent / "students.csv"
-    db.load_from_csv(path)
+def test_read_list_and_filter(client, student_data):
+    client.post("/students", json=student_data)
 
-    students = db.get_students_below_30("Мат. Анализ")
+    other = {**student_data, "faculty": "АВТФ"}
+    client.post("/students", json=other)
 
-    assert len(students) == 13
-    assert all(s.grade < 30 and s.course == "Мат. Анализ" for s in students)
+    response = client.get("/students")
+    assert len(response.json()) == 2
+
+    response = client.get("/students?faculty=ФПМИ")
+    assert len(response.json()) == 1
+    assert response.json()[0]["faculty"] == "ФПМИ"
 
 
-def test_average(db):
-    path = Path(__file__).resolve().parent / "students.csv"
-    db.load_from_csv(path)
+def test_update(client, student_data):
+    response = client.post("/students", json=student_data)
+    student_id = response.json()["id"]
 
-    assert db.get_average_grade("ФПМИ") == pytest.approx(49.225)
-    assert db.get_average_grade("НЕИЗВЕСТНЫЙ") is None
+    updated = {**student_data, "grade": 99, "course": "История"}
+    response = client.put(f"/students/{student_id}", json=updated)
+
+    assert response.status_code == 200
+    assert response.json()["grade"] == 99
+
+    response = client.get(f"/students/{student_id}")
+    assert response.json()["course"] == "История"
+
+
+def test_delete(client, student_data):
+    response = client.post("/students", json=student_data)
+    student_id = response.json()["id"]
+
+    response = client.delete(f"/students/{student_id}")
+
+    assert response.status_code == 204
+    assert response.content == b""
+
+    response = client.get(f"/students/{student_id}")
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize("method", ["get", "put", "delete"])
+def test_missing_student(client, student_data, method):
+    if method == "put":
+        response = client.put("/students/999", json=student_data)
+    elif method == "delete":
+        response = client.delete("/students/999")
+    else:
+        response = client.get("/students/999")
+
+    assert response.status_code == 404
+
+
+def test_bad_grade(client, student_data):
+    invalid = {**student_data, "grade": 101}
+
+    response = client.post("/students", json=invalid)
+
+    assert response.status_code == 422
+    assert client.get("/students").json() == []

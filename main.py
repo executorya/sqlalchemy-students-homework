@@ -1,6 +1,8 @@
 import csv
 from pathlib import Path
 
+from fastapi import FastAPI, HTTPException, Response
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Column, Integer, String, create_engine, func, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
@@ -32,7 +34,7 @@ class StudentDatabase:
         faculty: str,
         course: str,
         grade: int,
-    ) -> None:
+    ) -> int:
         student = Student(
             last_name=last_name,
             first_name=first_name,
@@ -44,11 +46,55 @@ class StudentDatabase:
         with self.SessionLocal() as session:
             session.add(student)
             session.commit()
+            return student.id
+
+    def get_student(self, student_id: int) -> Student | None:
+        with self.SessionLocal() as session:
+            return session.get(Student, student_id)
+
+    def get_all_students(self) -> list[Student]:
+        with self.SessionLocal() as session:
+            query = select(Student).order_by(Student.id)
+            return list(session.scalars(query).all())
+
+    def update_student(
+        self,
+        student_id: int,
+        last_name: str,
+        first_name: str,
+        faculty: str,
+        course: str,
+        grade: int,
+    ) -> bool:
+        with self.SessionLocal() as session:
+            student = session.get(Student, student_id)
+
+            if student is None:
+                return False
+
+            student.last_name = last_name
+            student.first_name = first_name
+            student.faculty = faculty
+            student.course = course
+            student.grade = grade
+
+            session.commit()
+            return True
+
+    def delete_student(self, student_id: int) -> bool:
+        with self.SessionLocal() as session:
+            student = session.get(Student, student_id)
+
+            if student is None:
+                return False
+
+            session.delete(student)
+            session.commit()
+            return True
 
     def load_from_csv(self, file_path: Path) -> int:
         with self.SessionLocal() as session:
-            existing = session.scalar(select(func.count(Student.id)))
-            if existing:
+            if session.scalar(select(func.count(Student.id))):
                 return 0
 
         students = []
@@ -101,33 +147,83 @@ class StudentDatabase:
             return session.scalar(select(func.count(Student.id))) or 0
 
 
-if __name__ == "__main__":
-    engine = create_engine("sqlite:///students.db")
-    Base.metadata.create_all(engine)
-    db = StudentDatabase(engine)
+class StudentData(BaseModel):
+    last_name: str = Field(min_length=1)
+    first_name: str = Field(min_length=1)
+    faculty: str = Field(min_length=1)
+    course: str = Field(min_length=1)
+    grade: int = Field(ge=0, le=100)
 
+
+class StudentResponse(StudentData):
+    id: int
+    model_config = ConfigDict(from_attributes=True)
+
+
+engine = create_engine("sqlite:///students.db")
+Base.metadata.create_all(engine)
+
+db = StudentDatabase(engine)
+app = FastAPI(title="Students CRUD API")
+
+
+@app.post("/students", response_model=StudentResponse, status_code=201)
+def create_student(student: StudentData) -> Student:
+    student_id = db.add_student(**student.model_dump())
+    created = db.get_student(student_id)
+
+    if created is None:
+        raise HTTPException(status_code=500, detail="Ошибка сохранения")
+
+    return created
+
+
+@app.get("/students", response_model=list[StudentResponse])
+def get_students(faculty: str | None = None) -> list[Student]:
+    if faculty is not None:
+        return db.get_students_by_faculty(faculty)
+
+    return db.get_all_students()
+
+
+@app.get("/students/{student_id}", response_model=StudentResponse)
+def get_student(student_id: int) -> Student:
+    student = db.get_student(student_id)
+
+    if student is None:
+        raise HTTPException(status_code=404, detail="Студент не найден")
+
+    return student
+
+
+@app.put("/students/{student_id}", response_model=StudentResponse)
+def update_student(student_id: int, student: StudentData) -> Student:
+    updated = db.update_student(student_id, **student.model_dump())
+
+    if not updated:
+        raise HTTPException(status_code=404, detail="Студент не найден")
+
+    result = db.get_student(student_id)
+
+    if result is None:
+        raise HTTPException(status_code=404, detail="Студент не найден")
+
+    return result
+
+
+@app.delete("/students/{student_id}", status_code=204)
+def delete_student(student_id: int) -> Response:
+    deleted = db.delete_student(student_id)
+
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Студент не найден")
+
+    return Response(status_code=204)
+
+
+if __name__ == "__main__":
     csv_path = Path(__file__).resolve().parent / "students.csv"
     loaded = db.load_from_csv(csv_path)
 
-    print(f"Новых записей загружено: {loaded}")
+    print(f"Загружено новых записей: {loaded}")
     print(f"Всего записей в БД: {db.count_students()}")
-
-    students = db.get_students_by_faculty("ФПМИ")
-    print(f"\nФПМИ — записей: {len(students)}")
-
-    for student in students[:5]:
-        print(student.last_name, student.first_name, student.grade)
-
-    print("\nУникальные курсы:")
-    for course in db.get_unique_courses():
-        print(course)
-
-    low_grades = db.get_students_below_30("Мат. Анализ")
-    print(f"\nМат. Анализ, оценка ниже 30: {len(low_grades)}")
-
-    for student in low_grades:
-        print(student.last_name, student.first_name, student.grade)
-
-    average = db.get_average_grade("ФПМИ")
-    if average is not None:
-        print(f"\nСредняя оценка ФПМИ: {average:.2f}")

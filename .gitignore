@@ -6,3 +6,4 @@ __pycache__/
 .vscode/
 .idea/
 students.db
+*.db-journal
